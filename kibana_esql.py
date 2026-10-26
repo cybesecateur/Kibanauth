@@ -606,7 +606,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if session is None:
-            parser.error("Indiquez --username/--password pour tester un mot de passe.")
+            parser.error("Avec --cookie seul, ajoutez --query ou --login-state.")
         _dump(fetch_current_user(args.url, session))
         return 0
     except (KibanaAuthError, EsqlQueryError, ValueError) as exc:

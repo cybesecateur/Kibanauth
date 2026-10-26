@@ -34,7 +34,10 @@ def _response(
         text = json.dumps(json_body)
     response.text = text
     response.headers = headers or {"Content-Type": "application/json"}
-    response.json.return_value = json.loads(text) if text else None
+    try:
+        response.json.return_value = json.loads(text) if text else None
+    except json.JSONDecodeError:
+        response.json.side_effect = json.JSONDecodeError("Expecting value", text, 0)
 
     def raise_for_status() -> None:
         if status_code >= 400:
