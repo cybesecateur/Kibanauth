@@ -7,14 +7,16 @@ Le programme sait :
 - interroger les fournisseurs de connexion pour voir si un SSO (SAML, OIDC, Kerberos ou PKI) est proposé ;
 - ouvrir une session avec le formulaire de connexion Kibana (`POST /internal/security/login`), puis, en secours, avec l'authentification HTTP Basic (`GET /internal/security/me`) ;
 - réutiliser un cookie de session navigateur `sid` ;
-- envoyer une requête ES|QL et renvoyer les lignes en JSON.
+- tester uniquement la connexion, sans lancer de requête ;
+- envoyer une requête ES|QL et renvoyer les lignes en JSON ;
+- désactiver la vérification du certificat SSL lorsqu'un certificat interne ou auto-signé bloque la connexion.
 
 ## Prérequis
 
 - Python 3.10 ou plus récent
 - Un Kibana joignable sur le réseau (8.11 ou plus récent pour ES|QL)
 
-La vérification TLS reste activée. Si Kibana présente un certificat d'une autorité interne, exportez `REQUESTS_CA_BUNDLE` vers le fichier de certificats correspondant.
+La vérification TLS reste activée par défaut. Si Kibana présente un certificat d'une autorité interne, exportez `REQUESTS_CA_BUNDLE` vers le fichier de certificats correspondant. Si l'erreur SSL persiste en production (certificat auto-signé, nom d'hôte différent, chaîne incomplète), ajoutez `--insecure` ou `-k` : la vérification du certificat est alors désactivée, l'avertissement `InsecureRequestWarning` d'urllib3 est masqué, et un message le signale clairement.
 
 ## Installation
 
@@ -60,13 +62,58 @@ python kibana_esql.py \
   --login-state
 ```
 
+## Désactiver la vérification SSL
+
+À n'utiliser que contre un Kibana dont vous maîtrisez le certificat, par exemple un certificat auto-signé en production.
+
+```bash
+python kibana_esql.py \
+  --url https://kibana.exemple:5601 \
+  --insecure \
+  --username elastic \
+  --password 'mot-de-passe' \
+  --test-login
+```
+
+`-k` est l'équivalent court de `--insecure`. Le programme affiche alors : « la vérification du certificat SSL est désactivée ».
+
+En bibliothèque, passez `verify_ssl=False` à `test_kibana_login`, `get_login_state`, `fetch_current_user` ou `run_esql`.
+
+## Tester uniquement la connexion
+
+`--test-login` vérifie que l'authentification fonctionne et s'arrête là : aucune requête ES|QL n'est envoyée. La session est contrôlée avec `GET /internal/security/me`. Le code de sortie vaut `0` si le profil est renvoyé, `1` si la connexion échoue.
+
+Avec un mot de passe :
+
+```bash
+python kibana_esql.py \
+  --url https://kibana.exemple:5601 \
+  --username elastic \
+  --password 'mot-de-passe' \
+  --test-login
+```
+
+Avec le cookie `sid` du navigateur :
+
+```bash
+python kibana_esql.py \
+  --url https://kibana.exemple:5601 \
+  --cookie 'sid=Fe26.2**....' \
+  --test-login
+```
+
+Le déroulé s'affiche au fur et à mesure (`Tentative de connexion via POST /internal/security/login`, `Connexion web réussie !` ou `Bascule sur HTTP Basic Auth`, puis `Vérification du profil via GET /internal/security/me`). Le JSON du profil suit ces messages sur la sortie standard.
+
+La même vérification a lieu sans `--test-login` lorsque seul un nom d'utilisateur et un mot de passe sont fournis. `--test-login` rend l'intention explicite et accepte aussi un cookie seul.
+
 ## Tester un mot de passe
 
 ```bash
 python kibana_esql.py \
   --url https://kibana.exemple:5601 \
   --username elastic \
-  --password 'mot-de-passe'
+  --password 'mot-de-passe' \
+  --test-login
 ```
 
 Ordre des essais :
@@ -105,6 +152,8 @@ python kibana_esql.py \
   --query 'FROM logs-* | KEEP @timestamp, message | LIMIT 5'
 ```
 
+Le programme annonce l'envoi (`Envoi de la requête ES|QL à POST /internal/bsearch`) puis le nombre de lignes (`Réponse reçue : X ligne(s) extraite(s)`). Ajoutez `--insecure` si le certificat TLS est refusé.
+
 Exemple de résultat :
 
 ```json
@@ -138,12 +187,14 @@ session = test_kibana_login(
     "https://kibana.exemple:5601",
     "elastic",
     "mot-de-passe",
+    verify_ssl=False,  # certificat auto-signé
 )
 
 lignes = run_esql(
     "FROM logs-* | LIMIT 10",
     "https://kibana.exemple:5601",
     session=session,
+    verify_ssl=False,
 )
 
 # Session navigateur, sans mot de passe :
