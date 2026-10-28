@@ -11,6 +11,8 @@ Le programme sait :
 - envoyer une requête ES|QL et renvoyer les lignes en JSON ;
 - désactiver la vérification du certificat SSL lorsqu'un certificat interne ou auto-signé bloque la connexion.
 
+Pour un Kibana dont vous n'avez que l'URL `/login` (chemin ou reverse-proxy non standard), utilisez le script court [`kibana-login-test.py`](kibana-login-test.py). Il ne fait pas d'ES|QL : il teste le mot de passe LDAP et le SSO.
+
 ## Prérequis
 
 - Python 3.10 ou plus récent
@@ -25,6 +27,42 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+## Script court : `kibana-login-test.py`
+
+`python kibana-login-test.py` part de l'URL de login réelle, par exemple `https://proxy.exemple/outils/kibana/login`. Le suffixe `/login` est retiré pour obtenir la base (`https://proxy.exemple/outils/kibana`), y compris quand un reverse-proxy ajoute un préfixe. Si le HTML contient `kbn-injected-metadata` avec un `basePath`, ce chemin est repris quand il ne contredit pas le préfixe déjà présent.
+
+À chaque appel, le script affiche l'URL, le code HTTP, les en-têtes utiles (`Location`, `Content-Type`, `WWW-Authenticate`, `Set-Cookie`) et les cookies reçus.
+
+```bash
+python kibana-login-test.py \
+  --url https://proxy.exemple/outils/kibana/login \
+  --username ada \
+  --password 'mot-de-passe' \
+  --insecure
+```
+
+Ordre des essais mot de passe :
+
+1. `POST /internal/security/login` avec les couples `providerType` / `providerName` `basic`/`ldap`, `ldap`/`ldap` et `basic`/`basic`.
+2. Les fournisseurs `basic` ou `ldap` découverts dans `/login` (`kbn-injected-metadata`) ou `GET /internal/security/login_state`.
+3. POST direct du formulaire vers l'URL `/login`.
+4. Secours HTTP Basic sur `GET /internal/security/me`.
+
+La connexion est acceptée si un cookie `sid` est posé ou si `/internal/security/me` répond correctement.
+
+Le SSO est inspecté ensuite (ou seul, avec `--test-sso`) : redirection de `GET /login`, fournisseurs `saml`, `oidc`, `kerberos` ou `pki`, puis `POST /internal/security/login` pour afficher l'URL d'autorisation. `--test-sso` termine avec le code `1` si aucune URL SSO n'est obtenue.
+
+Un cookie de navigateur déjà établi se vérifie sans mot de passe :
+
+```bash
+python kibana-login-test.py \
+  --url https://proxy.exemple/outils/kibana/login \
+  --cookie 'sid=Fe26.2**....' \
+  --insecure
+```
+
+`-k` est l'équivalent court de `--insecure` (certificat non vérifié, avertissement urllib3 masqué).
 
 ## Vérifier si le SSO est utilisé
 
