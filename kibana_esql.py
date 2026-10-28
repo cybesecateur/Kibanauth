@@ -16,6 +16,7 @@ import sys
 from typing import Any
 
 import requests
+import urllib3
 
 _SSO_PROVIDER_TYPES = frozenset({"saml", "oidc", "kerberos", "pki"})
 _COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
@@ -80,6 +81,21 @@ def _response_json(response: requests.Response) -> Any:
         ) from exc
 
 
+def _apply_verify_ssl(session: requests.Session, verify_ssl: bool) -> None:
+    """Active ou désactive la vérification du certificat SSL sur la session."""
+    session.verify = verify_ssl
+    if verify_ssl:
+        return
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    if getattr(session, "_kibanauth_insecure_announced", False) is True:
+        return
+    print(
+        "Attention : la vérification du certificat SSL est désactivée. "
+        "Les certificats présentés par Kibana ne seront pas contrôlés."
+    )
+    session._kibanauth_insecure_announced = True  # type: ignore[attr-defined]
+
+
 def _apply_cookie(session: requests.Session, cookie: str) -> None:
     """Pose un cookie `sid` brut, `sid=...`, ou un en-tête Cookie complet."""
     value = cookie.strip()
@@ -113,16 +129,23 @@ def _apply_cookie(session: requests.Session, cookie: str) -> None:
 def _prepare_session(
     session: requests.Session | None,
     cookie: str = "",
+    verify_ssl: bool = True,
 ) -> tuple[requests.Session, bool]:
     owns_session = session is None
     if session is None:
         session = requests.Session()
+    _apply_verify_ssl(session, verify_ssl)
     if cookie:
         _apply_cookie(session, cookie)
     return session, owns_session
 
 
-def test_kibana_login(base_url: str, username: str, password: str) -> requests.Session:
+def test_kibana_login(
+    base_url: str,
+    username: str,
+    password: str,
+    verify_ssl: bool = True,
+) -> requests.Session:
     """Teste la connexion Kibana et renvoie une session authentifiée.
 
     Essaie d'abord POST /internal/security/login (providerType et
@@ -131,7 +154,7 @@ def test_kibana_login(base_url: str, username: str, password: str) -> requests.S
     GET /internal/security/me.
     """
     base_url = _normalize_base_url(base_url)
-    session = requests.Session()
+    session, _owns_session = _prepare_session(None, verify_ssl=verify_ssl)
     session.headers.update(
         {
             "kbn-xsrf": "true",
@@ -149,6 +172,7 @@ def test_kibana_login(base_url: str, username: str, password: str) -> requests.S
             "password": password,
         },
     }
+    print("[1/3] Tentative de connexion via POST /internal/security/login...")
     web_login_ok = False
     try:
         response = session.post(
@@ -158,13 +182,17 @@ def test_kibana_login(base_url: str, username: str, password: str) -> requests.S
             timeout=_DEFAULT_TIMEOUT,
         )
         web_login_ok = _http_ok(response)
-    except requests.RequestException:
+    except requests.RequestException as exc:
+        print(f"Connexion web impossible : {exc}")
         web_login_ok = False
 
     if web_login_ok:
+        print("Connexion web réussie !")
         session.kibana_auth_method = "web_login"  # type: ignore[attr-defined]
         return session
 
+    print("Bascule sur HTTP Basic Auth...")
+    print("Vérification du profil via GET /internal/security/me...")
     session.auth = (username, password)
     me_url = f"{base_url}/internal/security/me"
     try:
@@ -183,6 +211,7 @@ def test_kibana_login(base_url: str, username: str, password: str) -> requests.S
             f"Authentification Kibana refusée (HTTP {status}). {detail}".rstrip()
         )
 
+    print("Connexion HTTP Basic réussie !")
     session.kibana_auth_method = "basic"  # type: ignore[attr-defined]
     return session
 
@@ -266,6 +295,7 @@ def get_login_state(
     base_url: str,
     session: requests.Session | None = None,
     cookie: str = "",
+    verify_ssl: bool = True,
 ) -> dict[str, Any]:
     """Indique si le SSO est proposé et liste les fournisseurs de connexion.
 
@@ -273,7 +303,8 @@ def get_login_state(
     terminaison répond 404, bascule sur GET /internal/security/me.
     """
     base_url = _normalize_base_url(base_url)
-    session, owns_session = _prepare_session(session, cookie)
+    print("Lecture des fournisseurs de connexion via GET /internal/security/login_state...")
+    session, owns_session = _prepare_session(session, cookie, verify_ssl=verify_ssl)
     try:
         response = session.get(
             f"{base_url}/internal/security/login_state",
@@ -281,15 +312,22 @@ def get_login_state(
             timeout=_DEFAULT_TIMEOUT,
         )
         status = getattr(response, "status_code", 0)
-        if status == 404:
-            return _login_state_from_me(session, base_url)
-        if not _http_ok(response):
+        if status == 404 or not _http_ok(response):
+            print(
+                "Point de terminaison login_state indisponible. "
+                "Bascule sur GET /internal/security/me..."
+            )
             return _login_state_from_me(session, base_url)
         payload = _response_json(response)
         providers = _normalize_providers(_extract_providers(payload))
+        sso = any(item["sso"] for item in providers)
+        print(
+            f"État de connexion reçu : {len(providers)} fournisseur(s), "
+            f"SSO {'activé' if sso else 'non détecté'}."
+        )
         return {
             "endpoint": "/internal/security/login_state",
-            "sso": any(item["sso"] for item in providers),
+            "sso": sso,
             "providers": providers,
         }
     finally:
@@ -297,9 +335,15 @@ def get_login_state(
             session.close()
 
 
-def fetch_current_user(base_url: str, session: requests.Session) -> dict[str, Any]:
+def fetch_current_user(
+    base_url: str,
+    session: requests.Session,
+    verify_ssl: bool = True,
+) -> dict[str, Any]:
     """Lit le profil renvoyé par GET /internal/security/me."""
     base_url = _normalize_base_url(base_url)
+    _prepare_session(session, verify_ssl=verify_ssl)
+    print("Vérification du profil via GET /internal/security/me...")
     response = session.get(
         f"{base_url}/internal/security/me",
         headers=_kbn_headers(),
@@ -314,10 +358,12 @@ def fetch_current_user(base_url: str, session: requests.Session) -> dict[str, An
     provider = payload.get("authentication_provider") or {}
     if not isinstance(provider, dict):
         provider = {}
+    username = payload.get("username")
+    print(f"Profil récupéré pour {username}.")
     return {
         "authenticated": True,
         "method": getattr(session, "kibana_auth_method", None),
-        "username": payload.get("username"),
+        "username": username,
         "roles": payload.get("roles"),
         "authentication_provider": provider,
         "sso": _is_sso_provider(provider),
@@ -471,6 +517,7 @@ def run_esql(
     kibana_url: str,
     session: requests.Session | None = None,
     cookie: str = "",
+    verify_ssl: bool = True,
 ) -> list[dict[str, Any]]:
     """Exécute une requête ES|QL via POST /internal/bsearch.
 
@@ -481,7 +528,8 @@ def run_esql(
         raise ValueError("La requête ES|QL est vide.")
 
     kibana_url = _normalize_base_url(kibana_url)
-    session, owns_session = _prepare_session(session, cookie)
+    print("Envoi de la requête ES|QL à POST /internal/bsearch...")
+    session, owns_session = _prepare_session(session, cookie, verify_ssl=verify_ssl)
     body = {
         "batch": [
             {
@@ -513,7 +561,9 @@ def run_esql(
                 f"/internal/bsearch a répondu HTTP {response.status_code}. {detail}".rstrip()
             ) from exc
 
-        return parse_bsearch_body(response.text or "")
+        rows = parse_bsearch_body(response.text or "")
+        print(f"Réponse reçue : {len(rows)} ligne(s) extraite(s).")
+        return rows
     finally:
         if owns_session:
             session.close()
@@ -552,6 +602,20 @@ def build_parser() -> argparse.ArgumentParser:
             "(GET /internal/security/login_state, ou /internal/security/me)"
         ),
     )
+    parser.add_argument(
+        "--test-login",
+        action="store_true",
+        help=(
+            "Tester uniquement l'authentification via GET /internal/security/me, "
+            "sans exécuter de requête ES|QL"
+        ),
+    )
+    parser.add_argument(
+        "-k",
+        "--insecure",
+        action="store_true",
+        help="Désactiver la vérification du certificat SSL",
+    )
     return parser
 
 
@@ -568,15 +632,52 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--password est requis avec --username.")
     if args.password and not args.username:
         parser.error("--username est requis avec --password.")
-    if not any([args.login_state, args.query, args.username, args.cookie]):
-        parser.error("Indiquez --login-state, --username/--password, --cookie ou --query.")
+    if args.test_login and args.query:
+        parser.error("--test-login teste seulement l'authentification. Retirez --query.")
+    if args.test_login and not (args.username or args.cookie):
+        parser.error("--test-login exige --username/--password ou --cookie.")
+    if not any(
+        [args.login_state, args.query, args.username, args.cookie, args.test_login]
+    ):
+        parser.error(
+            "Indiquez --login-state, --test-login, --username/--password, --cookie ou --query."
+        )
     if args.query and not (args.username or args.cookie):
         parser.error("Une requête ES|QL exige --username/--password ou --cookie.")
+
+    verify_ssl = not args.insecure
+    print(f"Kibana ciblé : {args.url}")
+    if args.test_login:
+        print("Mode --test-login : seule l'authentification est vérifiée.")
+    elif args.query:
+        print("Une requête ES|QL sera exécutée.")
+    elif args.login_state:
+        print("Lecture des fournisseurs de connexion demandée (--login-state).")
 
     try:
         session: requests.Session | None = None
         if args.username and args.password:
-            session = test_kibana_login(args.url, args.username, args.password)
+            print("Authentification avec le nom d'utilisateur et le mot de passe...")
+            session = test_kibana_login(
+                args.url,
+                args.username,
+                args.password,
+                verify_ssl=verify_ssl,
+            )
+
+        if args.test_login:
+            if session is None:
+                print("Utilisation du cookie de session fourni...")
+                session, _owns_cookie_session = _prepare_session(
+                    None,
+                    args.cookie,
+                    verify_ssl=verify_ssl,
+                )
+            print("[3/3] Contrôle final de la session...")
+            profile = fetch_current_user(args.url, session, verify_ssl=verify_ssl)
+            print("Authentification réussie.")
+            _dump(profile)
+            return 0
 
         if args.query:
             rows = run_esql(
@@ -584,19 +685,33 @@ def main(argv: list[str] | None = None) -> int:
                 args.url,
                 session=session,
                 cookie=args.cookie,
+                verify_ssl=verify_ssl,
             )
             _dump(rows)
             return 0
 
         if args.login_state:
-            report = get_login_state(args.url, session=session, cookie=args.cookie)
+            report = get_login_state(
+                args.url,
+                session=session,
+                cookie=args.cookie,
+                verify_ssl=verify_ssl,
+            )
             if session is not None or args.cookie:
                 profile_session = session
                 owns_profile_session = False
                 if profile_session is None:
-                    profile_session, owns_profile_session = _prepare_session(None, args.cookie)
+                    profile_session, owns_profile_session = _prepare_session(
+                        None,
+                        args.cookie,
+                        verify_ssl=verify_ssl,
+                    )
                 try:
-                    report["current_user"] = fetch_current_user(args.url, profile_session)
+                    report["current_user"] = fetch_current_user(
+                        args.url,
+                        profile_session,
+                        verify_ssl=verify_ssl,
+                    )
                 except KibanaAuthError as exc:
                     report["current_user_error"] = str(exc)
                 finally:
@@ -606,8 +721,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if session is None:
-            parser.error("Avec --cookie seul, ajoutez --query ou --login-state.")
-        _dump(fetch_current_user(args.url, session))
+            parser.error(
+                "Avec --cookie seul, ajoutez --query, --login-state ou --test-login."
+            )
+        print("[3/3] Contrôle final de la session...")
+        profile = fetch_current_user(args.url, session, verify_ssl=verify_ssl)
+        print("Authentification réussie.")
+        _dump(profile)
         return 0
     except (KibanaAuthError, EsqlQueryError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

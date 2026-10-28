@@ -6,13 +6,16 @@ import io
 import json
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import requests
+import urllib3
 
 from kibana_esql import (
     EsqlQueryError,
     KibanaAuthError,
+    fetch_current_user,
     get_login_state,
     main,
     parse_bsearch_body,
@@ -20,6 +23,26 @@ from kibana_esql import (
     run_esql,
     test_kibana_login,
 )
+
+KIBANA_URL = "https://kibana.exemple:5601"
+
+
+def _load_json_document(text: str) -> Any:
+    """Retourne le premier document JSON d'une sortie mêlée à des messages."""
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(text):
+        while index < len(text) and text[index] not in "{[":
+            index += 1
+        if index >= len(text):
+            break
+        try:
+            found, _end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            index += 1
+            continue
+        return found
+    raise AssertionError(f"JSON introuvable dans : {text!r}")
 
 
 def _response(
@@ -405,8 +428,10 @@ class TestCli(unittest.TestCase):
             code = main(["--url", "https://kibana.exemple:5601", "--login-state"])
 
         self.assertEqual(code, 0)
-        self.assertFalse(json.loads(stdout.getvalue())["sso"])
+        self.assertFalse(_load_json_document(stdout.getvalue())["sso"])
+        self.assertIn("Kibana ciblé", stdout.getvalue())
         get_login_state_mock.assert_called_once()
+        self.assertTrue(get_login_state_mock.call_args.kwargs["verify_ssl"])
 
     def test_query_without_credentials_is_rejected(self) -> None:
         stderr = io.StringIO()
@@ -448,13 +473,318 @@ class TestCli(unittest.TestCase):
             )
 
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(stdout.getvalue()), [{"count": 2}])
+        self.assertEqual(_load_json_document(stdout.getvalue()), [{"count": 2}])
+        self.assertIn("Une requête ES|QL sera exécutée.", stdout.getvalue())
         login_mock.assert_called_once_with(
             "https://kibana.exemple:5601",
             "elastic",
             "secret",
+            verify_ssl=True,
         )
         self.assertIs(run_mock.call_args.kwargs["session"], session)
+        self.assertTrue(run_mock.call_args.kwargs["verify_ssl"])
+
+
+class TestVerifySsl(unittest.TestCase):
+    @patch("kibana_esql.urllib3.disable_warnings")
+    @patch("kibana_esql.requests.Session")
+    def test_login_verify_ssl_false_disables_verification(
+        self,
+        session_cls: MagicMock,
+        disable_warnings: MagicMock,
+    ) -> None:
+        session = MagicMock()
+        session_cls.return_value = session
+        session.post.return_value = _response(200, json_body={"location": "/"})
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            result = test_kibana_login(
+                KIBANA_URL,
+                "elastic",
+                "secret",
+                verify_ssl=False,
+            )
+
+        self.assertIs(result, session)
+        self.assertFalse(session.verify)
+        disable_warnings.assert_called_with(urllib3.exceptions.InsecureRequestWarning)
+        self.assertIn("vérification du certificat SSL est désactivée", stdout.getvalue())
+        self.assertIn("Connexion web réussie !", stdout.getvalue())
+
+    @patch("kibana_esql.urllib3.disable_warnings")
+    def test_run_esql_verify_ssl_false(self, disable_warnings: MagicMock) -> None:
+        session = MagicMock()
+        session.post.return_value = _response(
+            200,
+            json_body={
+                "result": {
+                    "rawResponse": {
+                        "columns": [{"name": "n"}],
+                        "values": [[1], [2]],
+                    },
+                    "isRunning": False,
+                }
+            },
+        )
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            rows = run_esql(
+                "FROM logs-* | LIMIT 2",
+                KIBANA_URL,
+                session=session,
+                verify_ssl=False,
+            )
+
+        self.assertEqual(rows, [{"n": 1}, {"n": 2}])
+        self.assertFalse(session.verify)
+        disable_warnings.assert_called_with(urllib3.exceptions.InsecureRequestWarning)
+        text = stdout.getvalue()
+        self.assertIn("Envoi de la requête ES|QL à POST /internal/bsearch", text)
+        self.assertIn("Réponse reçue : 2 ligne(s) extraite(s).", text)
+        self.assertIn("vérification du certificat SSL est désactivée", text)
+
+    @patch("kibana_esql.urllib3.disable_warnings")
+    @patch("kibana_esql.requests.Session")
+    def test_get_login_state_verify_ssl_false(
+        self,
+        session_cls: MagicMock,
+        disable_warnings: MagicMock,
+    ) -> None:
+        session = MagicMock()
+        session_cls.return_value = session
+        session.get.return_value = _response(
+            200,
+            json_body={
+                "selector": {
+                    "providers": [
+                        {"type": "basic", "name": "basic", "usesLoginForm": True},
+                    ]
+                }
+            },
+        )
+
+        report = get_login_state(KIBANA_URL, verify_ssl=False)
+
+        self.assertFalse(report["sso"])
+        self.assertFalse(session.verify)
+        disable_warnings.assert_called_with(urllib3.exceptions.InsecureRequestWarning)
+
+    @patch("kibana_esql.urllib3.disable_warnings")
+    def test_fetch_current_user_verify_ssl_false(self, disable_warnings: MagicMock) -> None:
+        session = MagicMock()
+        session.kibana_auth_method = "web_login"
+        session.get.return_value = _response(
+            200,
+            json_body={
+                "username": "elastic",
+                "roles": ["superuser"],
+                "authentication_provider": {"type": "basic", "name": "basic"},
+            },
+        )
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            profile = fetch_current_user(KIBANA_URL, session, verify_ssl=False)
+
+        self.assertFalse(session.verify)
+        self.assertTrue(profile["authenticated"])
+        self.assertEqual(profile["username"], "elastic")
+        self.assertFalse(profile["sso"])
+        disable_warnings.assert_called_with(urllib3.exceptions.InsecureRequestWarning)
+        self.assertIn("Vérification du profil via GET /internal/security/me", stdout.getvalue())
+        session.get.assert_called_once()
+        self.assertIn("/internal/security/me", session.get.call_args.args[0])
+
+
+class TestTestLoginCli(unittest.TestCase):
+    @patch("kibana_esql.run_esql")
+    @patch("kibana_esql.fetch_current_user")
+    @patch("kibana_esql.test_kibana_login")
+    def test_password_login_succeeds(
+        self,
+        login_mock: MagicMock,
+        fetch_mock: MagicMock,
+        run_mock: MagicMock,
+    ) -> None:
+        session = MagicMock()
+        login_mock.return_value = session
+        fetch_mock.return_value = {
+            "authenticated": True,
+            "username": "elastic",
+            "method": "web_login",
+        }
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            code = main(
+                [
+                    "--url",
+                    KIBANA_URL,
+                    "--username",
+                    "elastic",
+                    "--password",
+                    "secret",
+                    "--test-login",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        run_mock.assert_not_called()
+        login_mock.assert_called_once_with(
+            KIBANA_URL,
+            "elastic",
+            "secret",
+            verify_ssl=True,
+        )
+        fetch_mock.assert_called_once_with(KIBANA_URL, session, verify_ssl=True)
+        text = stdout.getvalue()
+        self.assertIn("Mode --test-login", text)
+        self.assertIn("Authentification réussie.", text)
+        self.assertEqual(_load_json_document(text)["username"], "elastic")
+
+    @patch("kibana_esql.fetch_current_user")
+    @patch("kibana_esql.requests.Session")
+    def test_cookie_login_with_insecure_flag(
+        self,
+        session_cls: MagicMock,
+        fetch_mock: MagicMock,
+    ) -> None:
+        session = MagicMock()
+        session_cls.return_value = session
+        fetch_mock.return_value = {"authenticated": True, "username": "ada"}
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            code = main(
+                [
+                    "--url",
+                    KIBANA_URL,
+                    "-k",
+                    "--cookie",
+                    "sid=abc",
+                    "--test-login",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertFalse(session.verify)
+        session.cookies.set.assert_called_once_with("sid", "abc")
+        fetch_mock.assert_called_once_with(KIBANA_URL, session, verify_ssl=False)
+        text = stdout.getvalue()
+        self.assertIn("vérification du certificat SSL est désactivée", text)
+        self.assertIn("Authentification réussie.", text)
+        self.assertEqual(_load_json_document(text)["username"], "ada")
+
+    @patch("kibana_esql.fetch_current_user")
+    @patch("kibana_esql.test_kibana_login")
+    def test_insecure_long_flag_is_forwarded(
+        self,
+        login_mock: MagicMock,
+        fetch_mock: MagicMock,
+    ) -> None:
+        session = MagicMock()
+        login_mock.return_value = session
+        fetch_mock.return_value = {"authenticated": True, "username": "elastic"}
+
+        code = main(
+            [
+                "--url",
+                KIBANA_URL,
+                "--insecure",
+                "--username",
+                "elastic",
+                "--password",
+                "secret",
+                "--test-login",
+            ]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertFalse(login_mock.call_args.kwargs["verify_ssl"])
+        self.assertFalse(fetch_mock.call_args.kwargs["verify_ssl"])
+
+    @patch("kibana_esql.test_kibana_login", side_effect=KibanaAuthError("identifiants refusés"))
+    def test_password_failure_returns_exit_code_1(self, _login_mock: MagicMock) -> None:
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            code = main(
+                [
+                    "--url",
+                    KIBANA_URL,
+                    "--username",
+                    "elastic",
+                    "--password",
+                    "mauvais",
+                    "--test-login",
+                ]
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("identifiants refusés", stderr.getvalue())
+
+    @patch(
+        "kibana_esql.fetch_current_user",
+        side_effect=KibanaAuthError("/internal/security/me a répondu HTTP 401."),
+    )
+    @patch("kibana_esql.requests.Session")
+    def test_cookie_failure_returns_exit_code_1(
+        self,
+        session_cls: MagicMock,
+        _fetch_mock: MagicMock,
+    ) -> None:
+        session_cls.return_value = MagicMock()
+        stderr = io.StringIO()
+
+        with redirect_stderr(stderr):
+            code = main(
+                [
+                    "--url",
+                    KIBANA_URL,
+                    "--cookie",
+                    "sid=expire",
+                    "--test-login",
+                ]
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("HTTP 401", stderr.getvalue())
+
+    def test_test_login_rejects_a_query(self) -> None:
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            main(
+                [
+                    "--url",
+                    KIBANA_URL,
+                    "--username",
+                    "elastic",
+                    "--password",
+                    "secret",
+                    "--test-login",
+                    "--query",
+                    "FROM a",
+                ]
+            )
+        self.assertIn("--query", stderr.getvalue())
+
+    @patch("kibana_esql.requests.Session")
+    def test_basic_fallback_prints_french_steps(self, session_cls: MagicMock) -> None:
+        session = MagicMock()
+        session_cls.return_value = session
+        session.post.return_value = _response(401, text='{"message":"no"}')
+        session.get.return_value = _response(200, json_body={"username": "elastic"})
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            test_kibana_login(KIBANA_URL, "elastic", "secret")
+
+        text = stdout.getvalue()
+        self.assertIn("[1/3] Tentative de connexion via POST /internal/security/login", text)
+        self.assertIn("Bascule sur HTTP Basic Auth", text)
+        self.assertIn("Vérification du profil via GET /internal/security/me", text)
+        self.assertIn("Connexion HTTP Basic réussie !", text)
 
 
 if __name__ == "__main__":
